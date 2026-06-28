@@ -475,8 +475,6 @@ def _make_krea2_negpip_encode_token_weights(cond_stage_model):
             except TypeError:
                 return original_encode(token_weight_pairs)
 
-        debug = bool(getattr(cond_stage_model, "_krea2_negpip_debug", False))
-
         clip_model = getattr(cond_stage_model, KREA2_TEXT_ENCODER_KEY)
         pairs = token_weight_pairs[KREA2_TEXT_ENCODER_KEY]
         plan = _prepare_krea2_text_batch(pairs, clip_model)
@@ -491,19 +489,12 @@ def _make_krea2_negpip_encode_token_weights(cond_stage_model):
         )
         extra = _build_krea2_extra(encoded, pairs, template_end, cond.shape[1])
 
-        if debug and (plan.negative > 0 or plan.nonunit > 0):
-            print(
-                f"[Krea2 NegPip] weights parsed: nonunit={plan.nonunit}, "
-                f"negative_tokens={plan.negative}, sidecar_positions={len(negative_positions)}, "
-                f"cond_shape={tuple(cond.shape)}"
-            )
-
         return _intermediate(cond), first_pooled, extra
 
     return encode_token_weights
 
 
-def _patch_clip_for_krea2_negpip(clip, debug=False):
+def _patch_clip_for_krea2_negpip(clip):
     cond_stage_model = getattr(clip, "cond_stage_model", None)
     if cond_stage_model is None or not hasattr(cond_stage_model, KREA2_TEXT_ENCODER_KEY):
         raise RuntimeError("Krea2 NegPip requires CLIPLoader type='krea2'.")
@@ -518,7 +509,6 @@ def _patch_clip_for_krea2_negpip(clip, debug=False):
     )
 
     patched_cond_stage_model = new_clip.cond_stage_model
-    patched_cond_stage_model._krea2_negpip_debug = bool(debug)
 
     if not hasattr(patched_cond_stage_model, "_krea2_negpip_original_encode_token_weights"):
         patched_cond_stage_model._krea2_negpip_original_encode_token_weights = patched_cond_stage_model.encode_token_weights
@@ -954,25 +944,22 @@ def _patch_attention_once(attn, role: str, block_index: int | None = None):
     return True
 
 
-def _ensure_static_model_patches(dm: Any, debug: bool = False):
+def _ensure_static_model_patches(dm: Any):
     if getattr(dm, "_krea2_negpip_model_patched", False):
         return
 
-    patched_count = 0
     for i, block in enumerate(getattr(dm, "blocks", [])):
         if hasattr(block, "attn"):
-            patched_count += int(_patch_attention_once(block.attn, "main", i))
+            _patch_attention_once(block.attn, "main", i)
 
     # Patch refiner blocks too, but they stay on the original forward unless the node option is enabled.
     txtfusion = getattr(dm, "txtfusion", None)
     if txtfusion is not None and hasattr(txtfusion, "refiner_blocks"):
         for i, block in enumerate(txtfusion.refiner_blocks):
             if hasattr(block, "attn"):
-                patched_count += int(_patch_attention_once(block.attn, "txtfusion_refiner", i))
+                _patch_attention_once(block.attn, "txtfusion_refiner", i)
 
     dm._krea2_negpip_model_patched = True
-    if debug:
-        print(f"[Krea2 NegPip] static attention patches installed: {patched_count}")
 
 
 def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, transformer_options=None, **kwargs):
@@ -984,27 +971,17 @@ def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, t
     dm = executor.class_obj
     if not _is_krea2_dm(dm):
         context_without_sidecar, negative_positions, _, keep_indices = _parse_and_strip_sidecar_full(context)
-        original_attention_mask = attention_mask
         attention_mask = _strip_mask_with_indices(attention_mask, keep_indices, context.shape[1])
-        if cfg.get("debug", False) and original_attention_mask is not None and attention_mask is None:
-            print("[Krea2 NegPip] dropped mismatched attention_mask after sidecar strip")
         if negative_positions is not None:
             raise RuntimeError("Krea2 NegPip conditioning was connected to a non-Krea2 diffusion model.")
-        if cfg.get("debug", False):
-            print("[Krea2 NegPip] skipped: diffusion model is not Krea2 layout")
         return executor(x, timesteps, context_without_sidecar, attention_mask, transformer_options, **kwargs)
 
-    _ensure_static_model_patches(dm, debug=bool(cfg.get("debug", False)))
+    _ensure_static_model_patches(dm)
 
     original_context_len = context.shape[1]
-    context, negative_positions, sidecar_scales, keep_indices = _parse_and_strip_sidecar_full(context)
-    original_attention_mask = attention_mask
+    context, negative_positions, _, keep_indices = _parse_and_strip_sidecar_full(context)
     attention_mask = _strip_mask_with_indices(attention_mask, keep_indices, original_context_len)
-    if cfg.get("debug", False) and original_attention_mask is not None and attention_mask is None:
-        print("[Krea2 NegPip] dropped mismatched attention_mask after sidecar strip")
     if negative_positions is None:
-        if cfg.get("debug", False):
-            print("[Krea2 NegPip] no sidecar found; did you use the patched CLIP/Text Encode?")
         return executor(x, timesteps, context, attention_mask, transformer_options, **kwargs)
 
     total_neg = sum(len(r) for r in negative_positions)
@@ -1022,17 +999,6 @@ def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, t
     active_cfg["value_strength"] = value_strength
     new_transformer_options[WRAPPER_KEY] = active_cfg
 
-    if cfg.get("debug", False):
-        print(
-            f"[Krea2 NegPip] active: rows={len(negative_positions)} "
-            f"negative_tokens={total_neg} value_strength={value_strength:.3f} "
-            f"blocks={active_cfg.get('block_start', 0)}..{active_cfg.get('block_end', 999)} "
-            f"stride={active_cfg.get('block_stride', 1)} "
-            f"patch_txtfusion_refiners={bool(active_cfg.get('patch_txtfusion_refiners', False))} "
-            f"context_shape={tuple(context.shape)} "
-            f"sidecar_scale={sidecar_scales[:4] if sidecar_scales is not None else None}"
-        )
-
     return executor(x, timesteps, context, attention_mask, new_transformer_options, **kwargs)
 
 
@@ -1045,7 +1011,6 @@ class ApplyKrea2NegPip:
                 "clip": ("CLIP",),
                 "value_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05}),
                 "patch_txtfusion_refiners": ("BOOLEAN", {"default": False}),
-                "debug": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "block_start": ("INT", {"default": 0, "min": 0, "max": 999, "step": 1}),
@@ -1059,9 +1024,9 @@ class ApplyKrea2NegPip:
     FUNCTION = "apply"
     CATEGORY = "loaders"
 
-    def apply(self, model, clip, value_strength=1.0, patch_txtfusion_refiners=False, debug=False,
+    def apply(self, model, clip, value_strength=1.0, patch_txtfusion_refiners=False,
               block_start=0, block_end=27, block_stride=1):
-        new_clip = _patch_clip_for_krea2_negpip(clip, debug=debug)
+        new_clip = _patch_clip_for_krea2_negpip(clip)
         patched = model.clone()
 
         value_strength = _bounded_float(value_strength, 1.0, 0.0, 8.0)
@@ -1076,7 +1041,6 @@ class ApplyKrea2NegPip:
             "enabled": True,
             "value_strength": value_strength,
             "patch_txtfusion_refiners": bool(patch_txtfusion_refiners),
-            "debug": bool(debug),
             "block_start": block_start,
             "block_end": block_end,
             "block_stride": block_stride,
@@ -1095,12 +1059,6 @@ class ApplyKrea2NegPip:
             krea2_negpip_wrapper,
         )
 
-        if debug:
-            print(
-                f"[Krea2 NegPip] attached: value_strength={value_strength:.3f} "
-                f"patch_txtfusion_refiners={bool(patch_txtfusion_refiners)} "
-                f"blocks={block_start}..{block_end} stride={block_stride}"
-            )
         return patched, new_clip
 
 

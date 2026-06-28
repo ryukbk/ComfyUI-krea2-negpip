@@ -34,7 +34,6 @@ The node returns a patched `MODEL` and `CLIP`. Use those outputs for the rest of
 - `clip`: Krea 2 CLIP loaded with `CLIPLoader` type `krea2`.
 - `value_strength`: Strength of the negative prompt effect. Default: `1.0`.
 - `patch_txtfusion_refiners`: Optional stronger effect path. Default: `false`.
-- `debug`: Print diagnostic information to the console.
 - `block_start`: First transformer block to affect. Default: `0`.
 - `block_end`: Last transformer block to affect. Default: `27`.
 - `block_stride`: Affect every Nth block in the selected range. Default: `1`.
