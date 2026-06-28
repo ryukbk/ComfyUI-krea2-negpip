@@ -1,5 +1,7 @@
 # ComfyUI Krea 2 NegPip
 
+![ComfyUI Krea 2 NegPip screenshot](screenshot.webp)
+
 ComfyUI custom node that adds NegPip-style negative prompt weighting support for Krea 2 workflows.
 
 Use prompt weights such as `(word:-1.2)` to suppress specific concepts in Krea 2 prompts.
