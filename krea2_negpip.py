@@ -1,4 +1,4 @@
-# ComfyUI custom node: Krea 2 NegPip
+# ComfyUI custom node: Krea 2 NegPiP
 # Implementation module for ComfyUI/custom_nodes/ComfyUI-krea2-negpip.
 #
 # - CLIP/Qwen3-VL side enables negative prompt weights and emits a sidecar token.
@@ -497,7 +497,7 @@ def _make_krea2_negpip_encode_token_weights(cond_stage_model):
 def _patch_clip_for_krea2_negpip(clip):
     cond_stage_model = getattr(clip, "cond_stage_model", None)
     if cond_stage_model is None or not hasattr(cond_stage_model, KREA2_TEXT_ENCODER_KEY):
-        raise RuntimeError("Krea2 NegPip requires CLIPLoader type='krea2'.")
+        raise RuntimeError("Krea2 NegPiP requires CLIPLoader type='krea2'.")
 
     new_clip = clip.clone() if hasattr(clip, "clone") else copy.copy(clip)
     new_clip.tokenizer = copy.copy(clip.tokenizer)
@@ -936,7 +936,7 @@ def _patch_attention_once(attn, role: str, block_index: int | None = None):
     if getattr(attn, "_krea2_negpip_static_patched", False):
         return False
     if not _attention_has_expected_krea2_shape(attn):
-        raise RuntimeError("Krea2 NegPip cannot patch an unexpected Krea2 attention layout.")
+        raise RuntimeError("Krea2 NegPiP cannot patch an unexpected Krea2 attention layout.")
     original = attn.forward
     attn._krea2_negpip_original_forward = original
     attn.forward = _make_static_attention_forward(attn, original, role, block_index)
@@ -973,7 +973,7 @@ def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, t
         context_without_sidecar, negative_positions, _, keep_indices = _parse_and_strip_sidecar_full(context)
         attention_mask = _strip_mask_with_indices(attention_mask, keep_indices, context.shape[1])
         if negative_positions is not None:
-            raise RuntimeError("Krea2 NegPip conditioning was connected to a non-Krea2 diffusion model.")
+            raise RuntimeError("Krea2 NegPiP conditioning was connected to a non-Krea2 diffusion model.")
         return executor(x, timesteps, context_without_sidecar, attention_mask, transformer_options, **kwargs)
 
     _ensure_static_model_patches(dm)
@@ -1002,7 +1002,7 @@ def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, t
     return executor(x, timesteps, context, attention_mask, new_transformer_options, **kwargs)
 
 
-class ApplyKrea2NegPip:
+class ApplyKrea2NegPiP:
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -1063,11 +1063,11 @@ class ApplyKrea2NegPip:
 
 
 NODE_CLASS_MAPPINGS = {
-    "ApplyKrea2NegPip": ApplyKrea2NegPip,
+    "ApplyKrea2NegPiP": ApplyKrea2NegPiP,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ApplyKrea2NegPip": "Apply Krea2 NegPip",
+    "ApplyKrea2NegPiP": "Apply Krea2 NegPiP",
 }
 
 __all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"]

@@ -1,8 +1,8 @@
-# ComfyUI Krea 2 NegPip
+# ComfyUI Krea 2 NegPiP
 
-![ComfyUI Krea 2 NegPip screenshot](screenshot.webp)
+![ComfyUI Krea 2 NegPiP screenshot](screenshot.webp)
 
-ComfyUI custom node that adds NegPip-style negative prompt weighting support for Krea 2 workflows.
+ComfyUI custom node that adds NegPiP-style negative prompt weighting support for Krea 2 workflows.
 
 Use prompt weights such as `(word:-1.2)` to suppress specific concepts in Krea 2 prompts.
 
@@ -20,7 +20,7 @@ Restart ComfyUI after installation.
 ## Usage
 
 1. Load a Krea 2 model and Krea 2 CLIP as usual.
-2. Add the **Apply Krea2 NegPip** node.
+2. Add the **Apply Krea2 NegPiP** node.
 3. Connect both the `MODEL` and `CLIP` through this node before text encoding and sampling.
 4. Use negative prompt weights in the prompt, for example:
 
@@ -50,6 +50,6 @@ The node returns a patched `MODEL` and `CLIP`. Use those outputs for the rest of
 
 ## Credits
 
-This project is inspired by and references the original NegPip implementation:
+This project is inspired by and references the original NegPiP implementation:
 
 - [hako-mikan/sd-webui-negpip](https://github.com/hako-mikan/sd-webui-negpip)
