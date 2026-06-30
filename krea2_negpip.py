@@ -2,9 +2,9 @@
 # Implementation module for ComfyUI/custom_nodes/ComfyUI-krea2-negpip.
 #
 # - CLIP/Qwen3-VL side enables negative prompt weights and emits a sidecar token.
-# - DiT side strips the sidecar and stores active token positions in transformer_options.
-# - Krea2 Attention.forward is patched lazily once per model object, not every sampler step.
-# - Negative token V-flips are vectorized and cached per step/device.
+# - DiT side strips the sidecar, or falls back to conditioning extra metadata when available.
+# - Krea2 block/wv forwards are patched only for the active diffusion call and restored immediately.
+# - Negative token V-flips are vectorized and cached per call/device.
 
 from __future__ import annotations
 
@@ -17,17 +17,19 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
-from einops import rearrange
 
 from comfy import sd1_clip
 import comfy.model_management as model_management
+import comfy.samplers
 import comfy.patcher_extension
-from comfy.ldm.flux.math import apply_rope
-from comfy.ldm.modules.attention import optimized_attention_masked
+import comfy.text_encoders.qwen_vl
 
 
 WRAPPER_KEY = "krea2_negpip"
+NEGATIVE_POSITIONS_EXTRA_KEY = "krea2_negpip_negative_positions"
+NEGATIVE_SOURCE_LENGTH_EXTRA_KEY = "krea2_negpip_source_length"
+NEGATIVE_SIDECAR_TOKENS_EXTRA_KEY = "krea2_negpip_sidecar_tokens"
+NEGATIVE_METADATA_BY_UUID_KEY = "_negative_metadata_by_uuid"
 KREA2_TEXT_ENCODER_KEY = "qwen3vl_4b"
 KREA2_TAP_LAYERS = 12
 KREA2_TAP_DIM = 2560
@@ -53,17 +55,13 @@ SIDECAR_MARKER_RTOL = 0.05
 SIDECAR_CHECKSUM_MOD = 251
 SIDECAR_CHECKSUM_TOL = 1
 SIDECAR_POSITION_BASE = 128
+_IMAGE_TOKEN_WIDTH_CACHE: dict[tuple[int, int], int | None] = {}
 
 
 @dataclass(frozen=True)
 class TextBatchPlan:
     rows: list[Any]
-    nonunit: int
-    negative: int
-
-    @property
-    def has_weighted_tokens(self) -> bool:
-        return self.nonunit > 0
+    reference_indices: list[int | None]
 
 
 def _is_plain_int_token(x: Any) -> bool:
@@ -147,7 +145,7 @@ def _krea2_tokenize_with_weights(self, text, return_word_ids=False, llama_templa
             template = template.replace(vision_block, vision_block * len(images), 1)
         llama_text = template.format(text)
 
-    if not thinking:
+    if not thinking and not skip_template:
         llama_text += EMPTY_THINK_BLOCK
 
     tokens = sd1_clip.SD1Tokenizer.tokenize_with_weights(
@@ -177,11 +175,10 @@ def _sidecar_copy_bases(feature_dim: int) -> tuple[int, ...]:
     """
     Store the metadata redundantly at the beginning of every Krea2 tap-layer slice.
 
-    Conditioning Rebalance scales Krea2 conditioning as (B, seq, 12, 2560), so any
-    metadata stored in the main tensor is multiplied by both the global multiplier
-    and the per-layer gain.  By writing the same metadata to every layer slice and
-    parsing it with a scale-invariant marker, the sidecar survives normal rebalance
-    use unless the whole conditioning is multiplied by exactly zero.
+    Simple Krea2 rebalance/scaling nodes can multiply conditioning as (B, seq, 12, 2560).
+    By writing the same metadata to every layer slice and parsing it with a scale-invariant
+    marker, the sidecar survives simple nonzero scale-only edits.  More complex tensor
+    transforms such as normalization, averaging, or clamping can still destroy it.
     """
     if feature_dim == KREA2_FLAT_DIM:
         return KREA2_SIDECAR_COPY_BASES
@@ -275,7 +272,39 @@ def _embedded_token_width(token: Any) -> int | None:
         if data.ndim == 0:
             return 1
         return int(data.reshape(-1, data.shape[-1]).shape[0])
+    if isinstance(token, dict) and token.get("type") == "image" and torch.is_tensor(token.get("data")):
+        return _qwen3vl_image_token_width(token["data"])
     return None
+
+
+def _qwen3vl_image_token_width(image: torch.Tensor) -> int | None:
+    """Estimate Qwen3-VL image placeholder expansion from ComfyUI's image grid helper."""
+    if image.ndim != 4 or image.shape[1] <= 0 or image.shape[2] <= 0:
+        return None
+
+    cache_key = (int(image.shape[1]), int(image.shape[2]))
+    if cache_key in _IMAGE_TOKEN_WIDTH_CACHE:
+        return _IMAGE_TOKEN_WIDTH_CACHE[cache_key]
+
+    try:
+        _, grid = comfy.text_encoders.qwen_vl.process_qwen2vl_images(
+            image,
+            patch_size=16,
+            image_mean=[0.5, 0.5, 0.5],
+            image_std=[0.5, 0.5, 0.5],
+        )
+        merge_size = 2
+        grid_t = int(grid[0][0].item())
+        grid_h = int(grid[0][1].item())
+        grid_w = int(grid[0][2].item())
+        width = max(1, grid_t * (grid_h // merge_size) * (grid_w // merge_size))
+    except Exception:
+        width = None
+
+    if len(_IMAGE_TOKEN_WIDTH_CACHE) > 128:
+        _IMAGE_TOKEN_WIDTH_CACHE.clear()
+    _IMAGE_TOKEN_WIDTH_CACHE[cache_key] = width
+    return width
 
 
 def _expanded_token_index_map(section, seq_len: int) -> tuple[list[int | None], bool]:
@@ -283,8 +312,9 @@ def _expanded_token_index_map(section, seq_len: int) -> tuple[list[int | None], 
     Map tokenizer pair indexes to encoded hidden-state indexes.
 
     Comfy expands tensor embeddings and image placeholders inside SDClipModel.process_tokens.
-    Tensor embedding widths are visible here; image widths depend on preprocessing, so positions
-    after an image placeholder are treated as unknown instead of risking a wrong V flip.
+    Krea2/Qwen3-VL image widths are derived from the same resize/grid math as the vision
+    preprocessor, so TextEncodeKrea2's default image-before-prompt layout can still carry
+    negative weights on the text that follows the image.
     """
     index_map: list[int | None] = []
     encoded_index = 0
@@ -309,30 +339,50 @@ def _krea2_empty_tokens(clip_model, token_count: int):
     return sd1_clip.gen_empty_tokens(clip_model.special_tokens, token_count)
 
 
+def _section_has_nonunit_weights(section) -> bool:
+    return any((_pair_weight(entry) not in (None, 1.0)) for entry in section)
+
+
+def _make_krea2_reference_row(section, clip_model, max_width: int):
+    """
+    Build the neutral row used for Comfy-style prompt weighting.
+
+    For text-only prompts this preserves the previous behavior exactly: a plain empty
+    token row.  For vision prompts, a fully empty row has a different expanded length
+    because it lacks image embeddings, so keep the image/embedding placeholders in the
+    neutral row and replace plain text tokens with the tokenizer's empty/pad tokens.
+    """
+    empty = _krea2_empty_tokens(clip_model, max(len(section), max_width))
+    row = []
+    for i, entry in enumerate(section):
+        token = entry[0]
+        row.append(empty[i] if _is_plain_int_token(token) else token)
+    if len(row) < max_width:
+        row.extend(empty[len(row):max_width])
+    return row
+
+
 def _prepare_krea2_text_batch(pair_sections, clip_model):
     token_rows = []
+    reference_indices: list[int | None] = []
     max_width = 0
-    nonunit = 0
-    negative = 0
 
     for section in pair_sections:
         token_rows.append([entry[0] for entry in section])
+        reference_indices.append(None)
         max_width = max(max_width, len(section))
-        for entry in section:
-            weight = _pair_weight(entry)
-            if weight is None or weight == 1.0:
-                continue
-            nonunit += 1
-            negative += int(weight < 0)
 
-    needs_reference_row = nonunit > 0 or len(token_rows) == 0
-    if needs_reference_row:
+    for i, section in enumerate(pair_sections):
+        if _section_has_nonunit_weights(section):
+            reference_indices[i] = len(token_rows)
+            token_rows.append(_make_krea2_reference_row(section, clip_model, max_width))
+
+    if len(token_rows) == 0:
         token_rows.append(_krea2_empty_tokens(clip_model, max_width))
 
     return TextBatchPlan(
         rows=token_rows,
-        nonunit=nonunit,
-        negative=negative,
+        reference_indices=reference_indices,
     )
 
 
@@ -379,12 +429,12 @@ def _apply_krea2_token_magnitudes(
     return changed, negative_positions
 
 
-def _build_krea2_conditioning(encoded, pair_sections, has_weighted_tokens: bool, template_end: int):
+def _build_krea2_conditioning(encoded, pair_sections, reference_indices: list[int | None], template_end: int):
     raw_context = encoded[0]  # Krea2 raw: (B, 12, seq, 2560)
     if len(pair_sections) == 0:
-        return _make_sidecar(_flatten_krea2_taps(raw_context[-1:].clone()), []), []
+        merged = _flatten_krea2_taps(raw_context[-1:].clone())
+        return _make_sidecar(merged, []), [], int(merged.shape[1])
 
-    reference = raw_context[-1:] if has_weighted_tokens else None
     flattened_sections = []
     negative_positions: list[int] = []
     running_len = 0
@@ -393,7 +443,9 @@ def _build_krea2_conditioning(encoded, pair_sections, has_weighted_tokens: bool,
         current = raw_context[section_index:section_index + 1]
         visible_start = _find_krea2_user_prompt_start(section, current.shape[2], template_end)
 
-        if reference is not None:
+        reference_index = reference_indices[section_index] if section_index < len(reference_indices) else None
+        if reference_index is not None:
+            reference = raw_context[reference_index:reference_index + 1]
             current, row_positions = _apply_krea2_token_magnitudes(
                 current,
                 reference,
@@ -412,7 +464,7 @@ def _build_krea2_conditioning(encoded, pair_sections, has_weighted_tokens: bool,
         merged = flattened_sections[0]
     else:
         merged = torch.cat(flattened_sections, dim=1)
-    return _make_sidecar(merged, negative_positions), negative_positions
+    return _make_sidecar(merged, negative_positions), negative_positions, int(merged.shape[1])
 
 
 def _build_krea2_extra(encoded, pair_sections, template_end: int, cond_seq_len: int):
@@ -481,13 +533,17 @@ def _make_krea2_negpip_encode_token_weights(cond_stage_model):
         encoded = clip_model.encode(plan.rows)
         pooled = encoded[1]
         first_pooled = _intermediate(pooled[0:1]) if pooled is not None else None
-        cond, negative_positions = _build_krea2_conditioning(
+        cond, negative_positions, source_length = _build_krea2_conditioning(
             encoded,
             pairs,
-            plan.has_weighted_tokens,
+            plan.reference_indices,
             template_end,
         )
         extra = _build_krea2_extra(encoded, pairs, template_end, cond.shape[1])
+        if negative_positions:
+            extra[NEGATIVE_POSITIONS_EXTRA_KEY] = list(map(int, negative_positions))
+            extra[NEGATIVE_SOURCE_LENGTH_EXTRA_KEY] = int(source_length)
+            extra[NEGATIVE_SIDECAR_TOKENS_EXTRA_KEY] = max(0, int(cond.shape[1]) - int(source_length))
 
         return _intermediate(cond), first_pooled, extra
 
@@ -527,8 +583,8 @@ def _is_krea2_dm(dm: Any) -> bool:
     )
 
 
-def _decode_sidecar_row(tail_row: torch.Tensor) -> tuple[list[int], float, int | None] | None:
-    """Return (positions, recovered_scale, source_length) for one batch row."""
+def _decode_sidecar_row(tail_row: torch.Tensor) -> tuple[list[int], int | None] | None:
+    """Return (positions, source_length) for one batch row."""
     feature_dim = int(tail_row.shape[0])
     best = None
 
@@ -616,17 +672,18 @@ def _decode_sidecar_row(tail_row: torch.Tensor) -> tuple[list[int], float, int |
         if not _sidecar_checksum_matches(_sidecar_checksum(row), expected_checksum):
             continue
 
-        candidate = (row, scale, source_length)
+        candidate = (row, source_length, scale)
         # Prefer the least numerically tiny surviving copy.
-        if best is None or abs(candidate[1]) > abs(best[1]):
+        if best is None or abs(candidate[2]) > abs(best[2]):
             best = candidate
 
-    return best
+    if best is None:
+        return None
+    return best[0], best[1]
 
 
-def _parse_sidecar_token(token_rows: torch.Tensor) -> tuple[list[list[int]], list[float], list[int | None], bool]:
+def _parse_sidecar_token(token_rows: torch.Tensor) -> tuple[list[list[int]], list[int | None], bool]:
     positions: list[list[int]] = []
-    scales: list[float] = []
     source_lengths: list[int | None] = []
     found = False
 
@@ -634,16 +691,14 @@ def _parse_sidecar_token(token_rows: torch.Tensor) -> tuple[list[list[int]], lis
         decoded = _decode_sidecar_row(token_rows[b])
         if decoded is None:
             positions.append([])
-            scales.append(float("nan"))
             source_lengths.append(None)
             continue
-        row, scale, source_length = decoded
+        row, source_length = decoded
         positions.append(row)
-        scales.append(scale)
         source_lengths.append(source_length)
         found = True
 
-    return positions, scales, source_lengths, found
+    return positions, source_lengths, found
 
 
 def _sidecar_candidate_indices(context: torch.Tensor) -> set[int]:
@@ -690,25 +745,24 @@ def _sidecar_candidate_indices(context: torch.Tensor) -> set[int]:
 
 def _parse_and_strip_sidecar_full(
     context: torch.Tensor,
-) -> tuple[torch.Tensor, list[list[int]] | None, list[float] | None, list[int] | None]:
+) -> tuple[torch.Tensor, list[list[int]] | None, list[int] | None]:
     if context.ndim != 3 or context.shape[1] < 1 or context.shape[2] < SIDECAR_HEADER:
-        return context, None, None, None
+        return context, None, None
 
     merged_positions: list[list[int]] = [[] for _ in range(context.shape[0])]
-    scales: list[float] = []
     keep_indices: list[int] = []
     segment_start = 0
     found_any = False
     candidate_indices = _sidecar_candidate_indices(context)
     if not candidate_indices:
-        return context, None, None, None
+        return context, None, None
 
     for i in range(context.shape[1]):
         if i not in candidate_indices:
             keep_indices.append(i)
             continue
 
-        positions, token_scales, source_lengths, found = _parse_sidecar_token(context[:, i, :].detach())
+        positions, source_lengths, found = _parse_sidecar_token(context[:, i, :].detach())
         if not found:
             keep_indices.append(i)
             continue
@@ -722,12 +776,11 @@ def _parse_and_strip_sidecar_full(
 
         for b, row in enumerate(positions):
             merged_positions[b].extend(current_segment_start + pos for pos in row)
-        scales.extend(token_scales)
         found_any = True
         segment_start = len(keep_indices)
 
     if not found_any:
-        return context, None, None, None
+        return context, None, None
 
     if not keep_indices:
         stripped = context[:, :0, :]
@@ -737,12 +790,7 @@ def _parse_and_strip_sidecar_full(
         idx = torch.tensor(keep_indices, device=context.device, dtype=torch.long)
         stripped = context.index_select(1, idx)
 
-    return stripped, merged_positions, scales, keep_indices
-
-
-def _parse_and_strip_sidecar(context: torch.Tensor) -> tuple[torch.Tensor, list[list[int]] | None, list[float] | None]:
-    stripped, positions, scales, _ = _parse_and_strip_sidecar_full(context)
-    return stripped, positions, scales
+    return stripped, merged_positions, keep_indices
 
 
 def _strip_mask_with_indices(attention_mask: Any, keep_indices: list[int] | None, original_context_len: int):
@@ -773,20 +821,165 @@ def _strip_mask_with_indices(attention_mask: Any, keep_indices: list[int] | None
     return attention_mask.index_select(attention_mask.ndim - 1, idx)
 
 
-def _get_index_tensors_for_v(v: torch.Tensor, cfg: dict[str, Any]):
+def _collect_negative_metadata_by_uuid(conds: Any) -> dict[str, dict[str, Any]]:
+    metadata: dict[str, dict[str, Any]] = {}
+    if not isinstance(conds, list):
+        return metadata
+
+    for cond_group in conds:
+        if not isinstance(cond_group, list):
+            continue
+        for cond in cond_group:
+            if not isinstance(cond, dict):
+                continue
+            positions = cond.get(NEGATIVE_POSITIONS_EXTRA_KEY)
+            if not positions:
+                continue
+            cond_uuid = cond.get("uuid")
+            if cond_uuid is None:
+                continue
+            try:
+                row = [int(p) for p in positions]
+            except Exception:
+                continue
+            source_length = cond.get(NEGATIVE_SOURCE_LENGTH_EXTRA_KEY)
+            try:
+                source_length = int(source_length) if source_length is not None else None
+            except Exception:
+                source_length = None
+            sidecar_tokens = cond.get(NEGATIVE_SIDECAR_TOKENS_EXTRA_KEY)
+            try:
+                sidecar_tokens = int(sidecar_tokens) if sidecar_tokens is not None else None
+            except Exception:
+                sidecar_tokens = None
+            metadata[str(cond_uuid)] = {
+                "positions": row,
+                "source_length": source_length,
+                "sidecar_tokens": sidecar_tokens,
+            }
+    return metadata
+
+
+def _inject_negative_metadata_into_calc_args(args: dict[str, Any]) -> dict[str, Any]:
+    metadata = _collect_negative_metadata_by_uuid(args.get("conds"))
+    if not metadata:
+        return args
+
+    model_options = args.get("model_options", {}).copy()
+    transformer_options = model_options.get("transformer_options", {}).copy()
+    cfg = dict(transformer_options.get(WRAPPER_KEY, {}))
+    cfg[NEGATIVE_METADATA_BY_UUID_KEY] = metadata
+    transformer_options[WRAPPER_KEY] = cfg
+    model_options["transformer_options"] = transformer_options
+    args = dict(args)
+    args["model_options"] = model_options
+    return args
+
+
+def _make_krea2_negpip_calc_cond_batch(previous):
+    def calc_cond_batch(args):
+        args = _inject_negative_metadata_into_calc_args(args)
+
+        if previous is not None:
+            return previous(args)
+        return comfy.samplers.calc_cond_batch(
+            args["model"],
+            args["conds"],
+            args["input"],
+            args["sigma"],
+            args["model_options"],
+        )
+
+    calc_cond_batch._krea2_negpip_original = previous
+    return calc_cond_batch
+
+
+def _krea2_negpip_calc_cond_batch_wrapper(executor, model, conds, x_in, timestep, model_options):
+    args = {
+        "model": model,
+        "conds": conds,
+        "input": x_in,
+        "sigma": timestep,
+        "model_options": model_options,
+    }
+    args = _inject_negative_metadata_into_calc_args(args)
+    return executor(
+        args["model"],
+        args["conds"],
+        args["input"],
+        args["sigma"],
+        args["model_options"],
+    )
+
+
+def _negative_metadata_from_transformer_options(
+    transformer_options: Any,
+    context_len: int,
+) -> tuple[list[list[int]], int | None] | None:
+    if not isinstance(transformer_options, dict):
+        return None
+    cfg = transformer_options.get(WRAPPER_KEY)
+    if not isinstance(cfg, dict):
+        return None
+    metadata = cfg.get(NEGATIVE_METADATA_BY_UUID_KEY)
+    uuids = transformer_options.get("uuids")
+    if not isinstance(metadata, dict) or not isinstance(uuids, list) or not uuids:
+        return None
+
+    rows: list[list[int]] = []
+    found = False
+    trim_to_length: int | None = None
+    for cond_uuid in uuids:
+        item = metadata.get(str(cond_uuid))
+        if not isinstance(item, dict):
+            rows.append([])
+            continue
+
+        source_length = item.get("source_length")
+        if source_length is not None:
+            try:
+                source_length = int(source_length)
+                sidecar_tokens = item.get("sidecar_tokens")
+                sidecar_tokens = int(sidecar_tokens) if sidecar_tokens is not None else None
+                if source_length == int(context_len):
+                    pass
+                elif (
+                    sidecar_tokens is not None
+                    and sidecar_tokens > 0
+                    and source_length + sidecar_tokens == int(context_len)
+                ):
+                    trim_to_length = source_length if trim_to_length is None else min(trim_to_length, source_length)
+                else:
+                    rows.append([])
+                    continue
+            except Exception:
+                rows.append([])
+                continue
+
+        try:
+            row = [int(p) for p in item.get("positions", []) if 0 <= int(p) < int(context_len)]
+        except Exception:
+            row = []
+        rows.append(row)
+        found = found or bool(row)
+
+    return (rows, trim_to_length) if found else None
+
+
+def _get_index_tensors_for_flat_v(v: torch.Tensor, cfg: dict[str, Any]):
     positions = cfg.get("_negative_positions")
     value_strength = float(cfg.get("value_strength", 1.0))
     if not positions or value_strength == 0.0:
         return None
 
-    cache = cfg.setdefault("_index_cache", {})
-    key = (v.device, v.shape[0], v.shape[2], v.dtype, value_strength)
+    cache = cfg.setdefault("_flat_index_cache", {})
+    key = (v.device, v.shape[0], v.shape[1], v.dtype, value_strength)
     cached = cache.get(key)
     if cached is not None:
         return cached
 
     bsz = int(v.shape[0])
-    seq_len = int(v.shape[2])
+    seq_len = int(v.shape[1])
     src_rows = len(positions)
 
     batch_ids = []
@@ -806,160 +999,173 @@ def _get_index_tensors_for_v(v: torch.Tensor, cfg: dict[str, Any]):
 
     bi = torch.tensor(batch_ids, device=v.device, dtype=torch.long)
     pi = torch.tensor(pos_ids, device=v.device, dtype=torch.long)
-    mul = torch.tensor(multipliers, device=v.device, dtype=v.dtype).view(-1, 1, 1)
+    mul = torch.tensor(multipliers, device=v.device, dtype=v.dtype).view(-1, 1)
     cached = (bi, pi, mul)
     cache[key] = cached
     return cached
 
 
-def _apply_v_flip_inplace(v: torch.Tensor, cfg: dict[str, Any]) -> torch.Tensor:
-    tensors = _get_index_tensors_for_v(v, cfg)
+def _apply_flat_v_flip_inplace(v: torch.Tensor, cfg: dict[str, Any]) -> torch.Tensor:
+    if not torch.is_tensor(v) or v.ndim != 3:
+        return v
+    tensors = _get_index_tensors_for_flat_v(v, cfg)
     if tensors is None:
         return v
     bi, pi, mul = tensors
-    # v: B,H,L,D. Advanced-index only the affected token rows instead of materializing a BxL scale tensor.
-    v[bi, :, pi, :] = v[bi, :, pi, :] * mul
+    # v: B,L,(H*D), before the attention implementation rearranges to heads.
+    v[bi, pi, :] = v[bi, pi, :] * mul
     return v
 
 
-def _attention_signature_is_compatible(attn: Any) -> bool:
-    try:
-        params = inspect.signature(attn.forward).parameters
-    except Exception:
+def _cfg_active_for_block(cfg: dict[str, Any], role: str, block_index: int | None) -> bool:
+    if not cfg or not cfg.get("_active", False):
+        return False
+    if role == "main":
+        start = int(cfg.get("block_start", 0))
+        end = int(cfg.get("block_end", 9999))
+        stride = max(1, int(cfg.get("block_stride", 1)))
+        idx = int(block_index or 0)
+        return start <= idx <= end and ((idx - start) % stride) == 0
+    if role == "txtfusion_refiner":
+        return bool(cfg.get("patch_txtfusion_refiners", False))
+    return False
+
+
+def _patch_wv_for_runtime_v_flip(attn: Any) -> bool:
+    wv = getattr(attn, "wv", None)
+    if wv is None or getattr(wv, "_krea2_negpip_wv_patched", False):
+        return False
+    if not callable(getattr(wv, "forward", None)):
         return False
 
-    if "x" not in params and "hidden_states" not in params:
-        return False
+    original_forward = wv.forward
 
-    known = {
-        "x",
-        "hidden_states",
-        "freqs",
-        "freqs_cis",
-        "mask",
-        "attention_mask",
-        "attn_mask",
-        "transformer_options",
-    }
-    for name, param in params.items():
-        if param.kind in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD):
-            continue
-        if param.default is inspect.Parameter.empty and name not in known:
-            return False
+    def forward(self, *args, **kwargs):
+        out = original_forward(*args, **kwargs)
+        cfg = getattr(attn, "_krea2_negpip_runtime_cfg", None)
+        if cfg:
+            out = _apply_flat_v_flip_inplace(out, cfg)
+        return out
+
+    wv._krea2_negpip_original_forward = original_forward
+    wv.forward = types.MethodType(forward, wv)
+    wv._krea2_negpip_installed_forward = wv.forward
+    wv._krea2_negpip_wv_patched = True
     return True
 
 
-def _attention_has_expected_krea2_shape(attn: Any) -> bool:
-    required = ("wq", "wk", "wv", "gate", "qknorm", "wo", "heads", "kvheads")
-    if not all(hasattr(attn, name) for name in required):
+def _same_bound_method(a: Any, b: Any) -> bool:
+    return (
+        getattr(a, "__self__", None) is getattr(b, "__self__", None)
+        and getattr(a, "__func__", a) is getattr(b, "__func__", b)
+    )
+
+
+def _restore_wv_runtime_v_flip(attn: Any) -> bool:
+    wv = getattr(attn, "wv", None)
+    if wv is None or not getattr(wv, "_krea2_negpip_wv_patched", False):
         return False
-    if not _attention_signature_is_compatible(attn):
-        return False
+    original = getattr(wv, "_krea2_negpip_original_forward", None)
+    installed = getattr(wv, "_krea2_negpip_installed_forward", None)
+    if original is not None and (installed is None or _same_bound_method(wv.forward, installed)):
+        wv.forward = original
+    for name in ("_krea2_negpip_original_forward", "_krea2_negpip_installed_forward", "_krea2_negpip_wv_patched"):
+        try:
+            delattr(wv, name)
+        except AttributeError:
+            pass
     try:
-        heads = int(attn.heads)
-        kvheads = int(attn.kvheads)
-    except Exception:
+        delattr(attn, "_krea2_negpip_runtime_cfg")
+    except AttributeError:
+        pass
+    return True
+
+
+def _extract_transformer_options_for_block(signature: inspect.Signature, args, kwargs):
+    try:
+        bound = signature.bind_partial(*args, **kwargs)
+    except TypeError:
+        return None
+    return bound.arguments.get("transformer_options", None)
+
+
+def _patch_block_for_runtime_cfg(block: Any, attn: Any, role: str, block_index: int | None = None) -> bool:
+    if getattr(block, "_krea2_negpip_block_patched", False):
         return False
-    return heads > 0 and kvheads > 0 and heads % kvheads == 0
+    if not callable(getattr(block, "forward", None)):
+        return False
 
-
-def _extract_attention_call(signature: inspect.Signature, args, kwargs):
-    bound = signature.bind_partial(*args, **kwargs)
-    arguments = bound.arguments
-    x = arguments.get("x", arguments.get("hidden_states", None))
-    freqs = arguments.get("freqs", arguments.get("freqs_cis", None))
-    mask = arguments.get("mask", arguments.get("attention_mask", arguments.get("attn_mask", None)))
-    transformer_options = arguments.get("transformer_options", None)
-    if transformer_options is None:
-        transformer_options = {}
-    return x, freqs, mask, transformer_options
-
-
-def _make_static_attention_forward(attn_module, original_forward, role: str, block_index: int | None):
+    _patch_wv_for_runtime_v_flip(attn)
+    original_forward = block.forward
     original_signature = inspect.signature(original_forward)
 
     def forward(self, *args, **kwargs):
+        transformer_options = _extract_transformer_options_for_block(original_signature, args, kwargs)
+        cfg = transformer_options.get(WRAPPER_KEY, None) if isinstance(transformer_options, dict) else None
+        active_cfg = cfg if _cfg_active_for_block(cfg, role, block_index) else None
+
+        previous = getattr(attn, "_krea2_negpip_runtime_cfg", None)
+        if active_cfg is not None:
+            attn._krea2_negpip_runtime_cfg = active_cfg
         try:
-            x, freqs, mask, transformer_options = _extract_attention_call(original_signature, args, kwargs)
-        except TypeError:
             return original_forward(*args, **kwargs)
+        finally:
+            if previous is None:
+                try:
+                    delattr(attn, "_krea2_negpip_runtime_cfg")
+                except AttributeError:
+                    pass
+            else:
+                attn._krea2_negpip_runtime_cfg = previous
 
-        cfg = transformer_options.get(WRAPPER_KEY, None) if transformer_options is not None else None
-        if not cfg or not cfg.get("_active", False):
-            return original_forward(*args, **kwargs)
-
-        if role == "main":
-            start = int(cfg.get("block_start", 0))
-            end = int(cfg.get("block_end", 9999))
-            stride = max(1, int(cfg.get("block_stride", 1)))
-            idx = int(block_index or 0)
-            if idx < start or idx > end or ((idx - start) % stride) != 0:
-                return original_forward(*args, **kwargs)
-        elif role == "txtfusion_refiner":
-            if not bool(cfg.get("patch_txtfusion_refiners", False)):
-                return original_forward(*args, **kwargs)
-        else:
-            return original_forward(*args, **kwargs)
-
-        if x is None:
-            return original_forward(*args, **kwargs)
-
-        q = self.wq(x)
-        k = self.wk(x)
-        v = self.wv(x)
-        gate = self.gate(x)
-
-        q = rearrange(q, "B L (H D) -> B H L D", H=self.heads)
-        k = rearrange(k, "B L (H D) -> B H L D", H=self.kvheads)
-        v = rearrange(v, "B L (H D) -> B H L D", H=self.kvheads)
-
-        v = _apply_v_flip_inplace(v, cfg)
-
-        q, k = self.qknorm(q, k)
-        if freqs is not None:
-            q, k = apply_rope(q, k, freqs)
-        if self.kvheads != self.heads:
-            rep = self.heads // self.kvheads
-            k = k.repeat_interleave(rep, dim=1)
-            v = v.repeat_interleave(rep, dim=1)
-
-        out = optimized_attention_masked(
-            q, k, v, self.heads, mask=mask, skip_reshape=True,
-            transformer_options=transformer_options,
-        )
-        return self.wo(out * F.sigmoid(gate))
-
-    return types.MethodType(forward, attn_module)
-
-
-def _patch_attention_once(attn, role: str, block_index: int | None = None):
-    if getattr(attn, "_krea2_negpip_static_patched", False):
-        return False
-    if not _attention_has_expected_krea2_shape(attn):
-        raise RuntimeError("Krea2 NegPiP cannot patch an unexpected Krea2 attention layout.")
-    original = attn.forward
-    attn._krea2_negpip_original_forward = original
-    attn.forward = _make_static_attention_forward(attn, original, role, block_index)
-    attn._krea2_negpip_static_patched = True
+    block._krea2_negpip_original_forward = original_forward
+    block.forward = types.MethodType(forward, block)
+    block._krea2_negpip_installed_forward = block.forward
+    block._krea2_negpip_block_patched = True
     return True
 
 
-def _ensure_static_model_patches(dm: Any):
-    if getattr(dm, "_krea2_negpip_model_patched", False):
-        return
+def _restore_block_runtime_cfg(block: Any) -> bool:
+    if not getattr(block, "_krea2_negpip_block_patched", False):
+        return False
+    original = getattr(block, "_krea2_negpip_original_forward", None)
+    installed = getattr(block, "_krea2_negpip_installed_forward", None)
+    if original is not None and (installed is None or _same_bound_method(block.forward, installed)):
+        block.forward = original
+    for name in ("_krea2_negpip_original_forward", "_krea2_negpip_installed_forward", "_krea2_negpip_block_patched"):
+        try:
+            delattr(block, name)
+        except AttributeError:
+            pass
+    return True
 
+
+def _install_runtime_model_patches(dm: Any, cfg: dict[str, Any]):
     for i, block in enumerate(getattr(dm, "blocks", [])):
-        if hasattr(block, "attn"):
-            _patch_attention_once(block.attn, "main", i)
+        if hasattr(block, "attn") and _cfg_active_for_block(cfg, "main", i):
+            _patch_block_for_runtime_cfg(block, block.attn, "main", i)
 
-    # Patch refiner blocks too, but they stay on the original forward unless the node option is enabled.
     txtfusion = getattr(dm, "txtfusion", None)
     if txtfusion is not None and hasattr(txtfusion, "refiner_blocks"):
         for i, block in enumerate(txtfusion.refiner_blocks):
-            if hasattr(block, "attn"):
-                _patch_attention_once(block.attn, "txtfusion_refiner", i)
+            if hasattr(block, "attn") and _cfg_active_for_block(cfg, "txtfusion_refiner", i):
+                _patch_block_for_runtime_cfg(block, block.attn, "txtfusion_refiner", i)
 
-    dm._krea2_negpip_model_patched = True
+
+def _restore_runtime_model_patches(dm: Any):
+    for block in getattr(dm, "blocks", []):
+        attn = getattr(block, "attn", None)
+        if attn is not None:
+            _restore_wv_runtime_v_flip(attn)
+        _restore_block_runtime_cfg(block)
+
+    txtfusion = getattr(dm, "txtfusion", None)
+    if txtfusion is not None and hasattr(txtfusion, "refiner_blocks"):
+        for block in txtfusion.refiner_blocks:
+            attn = getattr(block, "attn", None)
+            if attn is not None:
+                _restore_wv_runtime_v_flip(attn)
+            _restore_block_runtime_cfg(block)
 
 
 def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, transformer_options=None, **kwargs):
@@ -970,19 +1176,24 @@ def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, t
 
     dm = executor.class_obj
     if not _is_krea2_dm(dm):
-        context_without_sidecar, negative_positions, _, keep_indices = _parse_and_strip_sidecar_full(context)
+        context_without_sidecar, negative_positions, keep_indices = _parse_and_strip_sidecar_full(context)
         attention_mask = _strip_mask_with_indices(attention_mask, keep_indices, context.shape[1])
         if negative_positions is not None:
             raise RuntimeError("Krea2 NegPiP conditioning was connected to a non-Krea2 diffusion model.")
         return executor(x, timesteps, context_without_sidecar, attention_mask, transformer_options, **kwargs)
 
-    _ensure_static_model_patches(dm)
-
     original_context_len = context.shape[1]
-    context, negative_positions, _, keep_indices = _parse_and_strip_sidecar_full(context)
+    context, negative_positions, keep_indices = _parse_and_strip_sidecar_full(context)
     attention_mask = _strip_mask_with_indices(attention_mask, keep_indices, original_context_len)
     if negative_positions is None:
-        return executor(x, timesteps, context, attention_mask, transformer_options, **kwargs)
+        metadata_fallback = _negative_metadata_from_transformer_options(transformer_options, context.shape[1])
+        if metadata_fallback is None:
+            return executor(x, timesteps, context, attention_mask, transformer_options, **kwargs)
+        negative_positions, trim_to_length = metadata_fallback
+        if trim_to_length is not None and trim_to_length < int(context.shape[1]):
+            context = context[:, :trim_to_length, :]
+            if torch.is_tensor(attention_mask) and attention_mask.ndim >= 1 and int(attention_mask.shape[-1]) == int(original_context_len):
+                attention_mask = attention_mask[..., :trim_to_length]
 
     total_neg = sum(len(r) for r in negative_positions)
     value_strength = _bounded_float(cfg.get("value_strength", 1.0), 1.0, 0.0, 8.0)
@@ -990,16 +1201,20 @@ def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, t
         return executor(x, timesteps, context, attention_mask, transformer_options, **kwargs)
 
     # Keep the original transformer_options shape but install a per-call active cfg.
-    # The patched Attention.forward reads this, so no per-step monkey-patching is needed.
+    # The temporary block/wv forward wrappers read this and are restored after this call.
     new_transformer_options = transformer_options.copy()
     active_cfg = dict(cfg)
     active_cfg["_active"] = True
     active_cfg["_negative_positions"] = negative_positions
-    active_cfg["_index_cache"] = {}
+    active_cfg["_flat_index_cache"] = {}
     active_cfg["value_strength"] = value_strength
     new_transformer_options[WRAPPER_KEY] = active_cfg
 
-    return executor(x, timesteps, context, attention_mask, new_transformer_options, **kwargs)
+    try:
+        _install_runtime_model_patches(dm, active_cfg)
+        return executor(x, timesteps, context, attention_mask, new_transformer_options, **kwargs)
+    finally:
+        _restore_runtime_model_patches(dm)
 
 
 class ApplyKrea2NegPiP:
@@ -1045,6 +1260,23 @@ class ApplyKrea2NegPiP:
             "block_end": block_end,
             "block_stride": block_stride,
         }
+
+        previous_calc = patched.model_options.get("sampler_calc_cond_batch_function")
+        previous_calc = getattr(previous_calc, "_krea2_negpip_original", previous_calc)
+        if previous_calc is None:
+            # Prefer ComfyUI's composable wrapper API.  The legacy sampler_calc hook
+            # bypasses CALC_COND_BATCH wrappers, so only use function chaining when a
+            # pre-existing custom hook forces that path.
+            patched.model_options.pop("sampler_calc_cond_batch_function", None)
+            if hasattr(patched, "remove_wrappers_with_key"):
+                patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.CALC_COND_BATCH, WRAPPER_KEY)
+            patched.add_wrapper_with_key(
+                comfy.patcher_extension.WrappersMP.CALC_COND_BATCH,
+                WRAPPER_KEY,
+                _krea2_negpip_calc_cond_batch_wrapper,
+            )
+        else:
+            patched.model_options["sampler_calc_cond_batch_function"] = _make_krea2_negpip_calc_cond_batch(previous_calc)
 
         if hasattr(patched, "remove_wrappers_with_key"):
             patched.remove_wrappers_with_key(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, WRAPPER_KEY)
