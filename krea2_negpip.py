@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import logging
 import math
 import numbers
 import types
@@ -27,6 +28,14 @@ import comfy.text_encoders.qwen_vl
 
 WRAPPER_KEY = "krea2_negpip"
 NEGATIVE_POSITIONS_EXTRA_KEY = "krea2_negpip_negative_positions"
+
+# debug: "off" is silent; "log" reports what the flip did; "measure" additionally runs each
+# step twice, with and without the flip, and reports the difference in the model output.
+DEBUG_OFF = "off"
+DEBUG_LOG = "log"
+DEBUG_MEASURE = "measure"
+DEBUG_MODES = [DEBUG_OFF, DEBUG_LOG, DEBUG_MEASURE]
+NEGATIVE_WEIGHTS_EXTRA_KEY = "krea2_negpip_negative_weights"
 NEGATIVE_SOURCE_LENGTH_EXTRA_KEY = "krea2_negpip_source_length"
 NEGATIVE_SIDECAR_TOKENS_EXTRA_KEY = "krea2_negpip_sidecar_tokens"
 NEGATIVE_METADATA_BY_UUID_KEY = "_negative_metadata_by_uuid"
@@ -428,6 +437,7 @@ def _apply_krea2_token_magnitudes(
     encoded_indices = []
     magnitudes = []
     negative_positions: list[int] = []
+    negative_weights: list[float] = []
     index_map, _ = _expanded_token_index_map(section, min(sample.shape[2], reference.shape[2]))
     token_limit = min(len(index_map), len(section))
 
@@ -445,25 +455,27 @@ def _apply_krea2_token_magnitudes(
 
         if weight < 0 and encoded_index >= visible_start:
             negative_positions.append(output_offset + encoded_index - visible_start)
+            negative_weights.append(abs(float(weight)))
 
     if not encoded_indices:
-        return sample, negative_positions
+        return sample, negative_positions, negative_weights
 
     changed = sample.clone()
     idx = torch.tensor(encoded_indices, device=sample.device, dtype=torch.long)
     scale = torch.tensor(magnitudes, device=sample.device, dtype=sample.dtype).view(1, 1, -1, 1)
     changed[:, :, idx, :] = torch.lerp(reference[:, :, idx, :], changed[:, :, idx, :], scale)
-    return changed, negative_positions
+    return changed, negative_positions, negative_weights
 
 
 def _build_krea2_conditioning(encoded, pair_sections, reference_indices: list[int | None], template_end: int):
     raw_context = encoded[0]  # Krea2 raw: (B, 12, seq, 2560)
     if len(pair_sections) == 0:
         merged = _flatten_krea2_taps(raw_context[-1:].clone())
-        return _make_sidecar(merged, []), [], int(merged.shape[1])
+        return _make_sidecar(merged, []), [], [], int(merged.shape[1])
 
     flattened_sections = []
     negative_positions: list[int] = []
+    negative_weights: list[float] = []
     running_len = 0
 
     for section_index, section in enumerate(pair_sections):
@@ -473,7 +485,7 @@ def _build_krea2_conditioning(encoded, pair_sections, reference_indices: list[in
         reference_index = reference_indices[section_index] if section_index < len(reference_indices) else None
         if reference_index is not None:
             reference = raw_context[reference_index:reference_index + 1]
-            current, row_positions = _apply_krea2_token_magnitudes(
+            current, row_positions, row_weights = _apply_krea2_token_magnitudes(
                 current,
                 reference,
                 section,
@@ -481,6 +493,7 @@ def _build_krea2_conditioning(encoded, pair_sections, reference_indices: list[in
                 running_len,
             )
             negative_positions.extend(row_positions)
+            negative_weights.extend(row_weights)
 
         visible = current[:, :, visible_start:]
         flattened = _flatten_krea2_taps(visible)
@@ -491,7 +504,8 @@ def _build_krea2_conditioning(encoded, pair_sections, reference_indices: list[in
         merged = flattened_sections[0]
     else:
         merged = torch.cat(flattened_sections, dim=1)
-    return _make_sidecar(merged, negative_positions), negative_positions, int(merged.shape[1])
+    return (_make_sidecar(merged, negative_positions), negative_positions,
+            negative_weights, int(merged.shape[1]))
 
 
 def _build_krea2_extra(encoded, pair_sections, template_end: int, cond_seq_len: int):
@@ -560,7 +574,7 @@ def _make_krea2_negpip_encode_token_weights(cond_stage_model):
         encoded = _encode_krea2_rows(clip_model, plan.rows)
         pooled = encoded[1]
         first_pooled = _intermediate(pooled[0:1]) if pooled is not None else None
-        cond, negative_positions, source_length = _build_krea2_conditioning(
+        cond, negative_positions, negative_weights, source_length = _build_krea2_conditioning(
             encoded,
             pairs,
             plan.reference_indices,
@@ -569,6 +583,7 @@ def _make_krea2_negpip_encode_token_weights(cond_stage_model):
         extra = _build_krea2_extra(encoded, pairs, template_end, cond.shape[1])
         if negative_positions:
             extra[NEGATIVE_POSITIONS_EXTRA_KEY] = list(map(int, negative_positions))
+            extra[NEGATIVE_WEIGHTS_EXTRA_KEY] = [float(w) for w in negative_weights]
             extra[NEGATIVE_SOURCE_LENGTH_EXTRA_KEY] = int(source_length)
             extra[NEGATIVE_SIDECAR_TOKENS_EXTRA_KEY] = max(0, int(cond.shape[1]) - int(source_length))
 
@@ -879,8 +894,16 @@ def _collect_negative_metadata_by_uuid(conds: Any) -> dict[str, dict[str, Any]]:
                 sidecar_tokens = int(sidecar_tokens) if sidecar_tokens is not None else None
             except Exception:
                 sidecar_tokens = None
+            weights = cond.get(NEGATIVE_WEIGHTS_EXTRA_KEY)
+            try:
+                weights = [float(w) for w in weights] if weights else None
+            except Exception:
+                weights = None
+            if weights is not None and len(weights) != len(row):
+                weights = None          # only trust a weight list that lines up with positions
             metadata[str(cond_uuid)] = {
                 "positions": row,
+                "weights": weights,
                 "source_length": source_length,
                 "sidecar_tokens": sidecar_tokens,
             }
@@ -1032,6 +1055,183 @@ def _get_index_tensors_for_flat_v(v: torch.Tensor, cfg: dict[str, Any]):
     return cached
 
 
+def _text_span_end(extra_options: Any, seq_len: int) -> int:
+    """Last valid text position + 1.
+
+    comfy.ldm.krea2.model.SingleStreamDiT builds the sequence as
+    ``torch.cat((context, img), dim=1)`` and advertises ``img_slice = [txtlen, total]``,
+    so text is the PREFIX [0, txtlen) and needs no offset. The bound is enforced anyway:
+    a position at or past txtlen would silently scale an image token, which is invisible in
+    the output but corrupts the latent.
+    """
+    if isinstance(extra_options, dict):
+        img_slice = extra_options.get("img_slice")
+        if isinstance(img_slice, (list, tuple)) and len(img_slice) >= 1:
+            try:
+                end = int(img_slice[0])
+            except (TypeError, ValueError):
+                end = 0
+            if 0 < end <= seq_len:
+                return end
+    return seq_len
+
+
+def _flip_v_rows_(v: torch.Tensor, positions: list[list[int]], value_strength: float,
+                  span_end: int, weights: list[list[float]] | None = None) -> int:
+    """v is (B, H, L, D) as handed to attn1_patch. Returns how many rows were flipped."""
+    bsz = int(v.shape[0])
+    seq_len = int(v.shape[2])
+    src_rows = len(positions)
+    flipped = 0
+    dropped = 0
+
+    for b in range(bsz):
+        row = positions[b if src_rows == bsz else (b % src_rows)]
+        if not row:
+            continue
+        row_weights = None
+        if weights is not None:
+            source = weights[b if len(weights) == bsz else (b % len(weights))]
+            if len(source) == len(row):
+                row_weights = source
+
+        pairs = [(int(p), (row_weights[i] if row_weights else 1.0))
+                 for i, p in enumerate(row) if 0 <= int(p) < span_end]
+        dropped += len(row) - len(pairs)
+        if not pairs:
+            continue
+
+        # Group by multiplier so each distinct |weight| is one indexed write. The multiplier is
+        # a Python scalar, not a tensor of v.dtype: constructing and multiplying an fp8 tensor
+        # is unsupported on several backends, and an integer dtype would truncate a fractional
+        # strength to 0.
+        by_multiplier: dict[float, list[int]] = {}
+        for pos, weight in pairs:
+            by_multiplier.setdefault(-float(weight) * float(value_strength), []).append(pos)
+        for multiplier, group in by_multiplier.items():
+            idx = torch.tensor(group, device=v.device, dtype=torch.long)
+            v[b, :, idx, :] = v[b, :, idx, :] * multiplier
+        flipped += len(pairs)
+
+    if dropped:
+        logging.warning(
+            "Krea2 NegPiP: dropped %d negative position(s) at or beyond the text span "
+            "(txtlen=%d, seq_len=%d). The conditioning and the model disagree about the "
+            "prompt length.", dropped, span_end, seq_len,
+        )
+    return flipped
+
+
+def _v_row_magnitudes(v: torch.Tensor, keep: list[int], span_end: int) -> str:
+    """Mean |v| on the flipped rows against the rest of the text, and the image tokens.
+
+    This is the magnitude being flipped - NOT the attention mass it ends up carrying. The
+    softmax weight cannot be measured here: attn1_patch runs before apply_rope(), so q and k
+    at this point are not the tensors attention actually sees.
+    """
+    with torch.no_grad():
+        f32 = v.detach().float()
+        idx = torch.tensor(keep, device=v.device, dtype=torch.long)
+        flipped = f32[:, :, idx, :].abs().mean().item()
+        text_mask = torch.ones(f32.shape[2], dtype=torch.bool, device=v.device)
+        text_mask[span_end:] = False
+        text_mask[idx] = False
+        other_text = f32[:, :, text_mask, :].abs().mean().item() if bool(text_mask.any()) else float("nan")
+        image = f32[:, :, span_end:, :].abs().mean().item() if span_end < f32.shape[2] else float("nan")
+    return (f"mean|v| flipped={flipped:.4g} other_text={other_text:.4g} image={image:.4g} "
+            f"(flipped/other_text={flipped / other_text:.3g})" if other_text == other_text
+            else f"mean|v| flipped={flipped:.4g}")
+
+
+def _resolve_negative_weights(transformer_options: Any, positions: list[list[int]]):
+    """Per-token |weight| aligned to `positions`, or None when it cannot be trusted.
+
+    The sidecar carries positions only, so the weights travel through the uuid-keyed metadata
+    that _collect_negative_metadata_by_uuid already builds on every calc_cond_batch. They are
+    matched by ORDER, not by value: a merged conditioning shifts positions by a segment offset,
+    but both lists are produced in the same order. Any length mismatch and the whole thing is
+    discarded rather than guessed at.
+    """
+    if not isinstance(transformer_options, dict):
+        return None
+    cfg = transformer_options.get(WRAPPER_KEY)
+    metadata = cfg.get(NEGATIVE_METADATA_BY_UUID_KEY) if isinstance(cfg, dict) else None
+    uuids = transformer_options.get("uuids")
+    if not isinstance(metadata, dict) or not isinstance(uuids, list) or not uuids:
+        return None
+
+    rows: list[list[float]] = []
+    saw_weight = False
+    for index, row in enumerate(positions):
+        weights = None
+        if index < len(uuids):
+            item = metadata.get(str(uuids[index]))
+            if isinstance(item, dict):
+                candidate = item.get("weights")
+                if isinstance(candidate, list) and len(candidate) == len(row):
+                    weights = [abs(float(w)) for w in candidate]
+                    saw_weight = True
+        rows.append(weights if weights is not None else [1.0] * len(row))
+    return rows if saw_weight else None
+
+
+def _make_attn1_v_flip_patch(cfg: dict[str, Any]):
+    """Flip V via the hook comfy.ldm.krea2.model.Attention.forward already calls.
+
+    The previous implementation replaced ``wv.forward`` with a bound method on the module
+    instance. That is invisible to anything that captures the graph instead of re-entering
+    Python per step - torch.compile, and the quantized/fused backends built on it - so the
+    flip ran during warm-up (hence the debug output in issue #8) and then silently stopped
+    applying for the actual sampling steps. attn1_patch lives inside Attention.forward, so
+    it is part of whatever gets traced.
+    """
+    def patch(q, k, v, pe=None, attn_mask=None, extra_options=None):
+        out = {"q": q, "k": k, "v": v, "pe": pe, "attn_mask": attn_mask}
+        positions = cfg.get("_negative_positions")
+        value_strength = float(cfg.get("value_strength", 1.0))
+        if not positions or value_strength == 0.0:
+            return out
+        if not torch.is_tensor(v) or v.ndim != 4:
+            return out
+
+        block_index = None
+        if isinstance(extra_options, dict):
+            block_index = extra_options.get("block_index")
+        if not _cfg_active_for_block(cfg, "main", block_index):
+            return out
+
+        span_end = _text_span_end(extra_options, int(v.shape[2]))
+        v = v.clone()            # do not mutate a tensor the caller may still hold
+        flipped = _flip_v_rows_(v, positions, value_strength, span_end,
+                                cfg.get("_negative_weights"))
+        out["v"] = v
+
+        stats = cfg.get("_stats")
+        if isinstance(stats, dict):
+            stats["blocks"].add(int(block_index or 0))
+            stats["rows"] += flipped
+            if cfg.get("_debug") and not stats["probed"]:
+                stats["probed"] = True
+                keep = [int(p) for p in positions[0] if 0 <= int(p) < span_end]
+                detail = _v_row_magnitudes(v, keep, span_end) if keep else "no rows in span"
+                weights = cfg.get("_negative_weights")
+                if weights:
+                    effective = [f"{-abs(float(w)) * value_strength:.3g}" for w in weights[0]]
+                    strength_text = (f"prompt|w|={[abs(float(w)) for w in weights[0]]} "
+                                     f"x value_strength={value_strength:.3g} "
+                                     f"-> multiplier={effective}")
+                else:
+                    strength_text = (f"value_strength={value_strength:.3g} "
+                                     f"(no per-token weights available)")
+                logging.info(
+                    "[Krea2 NegPiP] block %s: v.shape=%s txtlen=%d rows=%s %s | %s",
+                    block_index, tuple(v.shape), span_end, keep, strength_text, detail,
+                )
+        return out
+
+    return patch
+
+
 def _apply_flat_v_flip_inplace(v: torch.Tensor, cfg: dict[str, Any]) -> torch.Tensor:
     if not torch.is_tensor(v) or v.ndim != 3:
         return v
@@ -1168,10 +1368,11 @@ def _restore_block_runtime_cfg(block: Any) -> bool:
 
 
 def _install_runtime_model_patches(dm: Any, cfg: dict[str, Any]):
-    for i, block in enumerate(getattr(dm, "blocks", [])):
-        if hasattr(block, "attn") and _cfg_active_for_block(cfg, "main", i):
-            _patch_block_for_runtime_cfg(block, block.attn, "main", i)
+    """Kept for the txtfusion refiners only; main blocks use attn1_patch."""
+    _install_txtfusion_patches(dm, cfg)
 
+
+def _install_txtfusion_patches(dm: Any, cfg: dict[str, Any]):
     txtfusion = getattr(dm, "txtfusion", None)
     if txtfusion is not None and hasattr(txtfusion, "refiner_blocks"):
         for i, block in enumerate(txtfusion.refiner_blocks):
@@ -1233,15 +1434,140 @@ def krea2_negpip_wrapper(executor, x, timesteps, context, attention_mask=None, r
     active_cfg = dict(cfg)
     active_cfg["_active"] = True
     active_cfg["_negative_positions"] = negative_positions
+    # Per-token |weight| so that (word:-2) negates twice as hard as (word:-1). Without this the
+    # prompt weight is inert: on the CLIP side it only scales the embedding magnitude, and the
+    # model's txtmlp opens with RMSNorm and has no residual, so that magnitude is normalised
+    # away before the DiT blocks ever see it.
+    active_cfg["_negative_weights"] = _resolve_negative_weights(transformer_options,
+                                                                negative_positions)
     active_cfg["_flat_index_cache"] = {}
     active_cfg["value_strength"] = value_strength
     new_transformer_options[WRAPPER_KEY] = active_cfg
 
+    debug_mode = _debug_mode(cfg.get("debug"))
+    debug = debug_mode != DEBUG_OFF
+    measure = debug_mode == DEBUG_MEASURE
+    active_cfg["_debug"] = debug
+    active_cfg["_stats"] = {"blocks": set(), "rows": 0, "probed": False}
+    if debug:
+        logging.info(
+            "[Krea2 NegPiP] call: positions=%s txtlen(pre-model)=%d value_strength=%.3g "
+            "blocks=%s..%s step=%s",
+            negative_positions, int(context.shape[1]), value_strength,
+            cfg.get("block_start", 0), cfg.get("block_end", 27),
+            _bump_debug_call_counter(cfg),
+        )
+
+    flip_patch = _make_attn1_v_flip_patch(active_cfg)
+    patches = dict(new_transformer_options.get("patches") or {})
+    attn1 = list(patches.get("attn1_patch") or [])
+    patches["attn1_patch"] = attn1 + [flip_patch]
+    new_transformer_options["patches"] = patches
+
+    if cfg.get("patch_txtfusion_refiners", False):
+        # txtfusion runs before the block loop sets transformer_options["block_index"], so
+        # Attention.forward never reaches attn1_patch there. The refiners still need the
+        # module-level patch, and only those blocks get it.
+        try:
+            _install_txtfusion_patches(dm, active_cfg)
+            return executor(x, timesteps, context, attention_mask, ref_latents, new_transformer_options, **kwargs)
+        finally:
+            _restore_runtime_model_patches(dm)
+
     try:
-        _install_runtime_model_patches(dm, active_cfg)
+        if measure:
+            return _debug_measure_effect(
+                executor, x, timesteps, context, attention_mask, ref_latents,
+                new_transformer_options, flip_patch, kwargs,
+            )
         return executor(x, timesteps, context, attention_mask, ref_latents, new_transformer_options, **kwargs)
     finally:
-        _restore_runtime_model_patches(dm)
+        if debug:
+            stats = active_cfg["_stats"]
+            blocks = sorted(stats["blocks"])
+            logging.info(
+                "[Krea2 NegPiP] applied: %d block(s) %s, %d row-flip(s) total. "
+                "A line per sampling step means the flip is live; one line then nothing means "
+                "it only ran during warm-up.",
+                len(blocks),
+                f"{blocks[0]}..{blocks[-1]}" if blocks else "NONE - the flip never ran",
+                stats["rows"],
+            )
+
+
+def _debug_measure_effect(executor, x, timesteps, context, attention_mask, ref_latents,
+                          transformer_options, flip_patch, kwargs):
+    """Run this step twice - with and without the V flip - and report the difference.
+
+    This is the only honest measurement available from here. The softmax weight on the
+    flipped rows cannot be read inside attn1_patch, because that hook runs before
+    apply_rope(), so q and k there are not the tensors attention actually sees. Comparing the
+    two model outputs sidesteps that entirely: it is the end-to-end effect of the flip on the
+    predicted noise, which is what has to be non-trivial for the image to change at all.
+
+    Costs one extra forward pass, on the first sampling step only.
+    """
+    with_flip = executor(x, timesteps, context, attention_mask, ref_latents,
+                         transformer_options, **kwargs)
+
+    baseline_options = dict(transformer_options)
+    baseline_patches = dict(baseline_options.get("patches") or {})
+    baseline_patches["attn1_patch"] = [
+        p for p in (baseline_patches.get("attn1_patch") or []) if p is not flip_patch
+    ]
+    baseline_options["patches"] = baseline_patches
+    baseline = executor(x, timesteps, context, attention_mask, ref_latents,
+                        baseline_options, **kwargs)
+
+    try:
+        with torch.no_grad():
+            a = with_flip.detach().float()
+            b = baseline.detach().float()
+            denom = b.norm().item()
+            rel = ((a - b).norm().item() / denom) if denom > 0 else float("nan")
+            peak = (a - b).abs().max().item()
+        if rel < 0.001:
+            verdict = ("negligible - the flip cannot move the image at this strength. Raise "
+                       "value_strength (the prompt weight does not control it: txtmlp opens "
+                       "with RMSNorm and has no residual, so per-token magnitude is "
+                       "normalised away)")
+        elif rel < 0.01:
+            verdict = "small but real - expect a subtle change"
+        else:
+            verdict = ("substantial - the flip has full authority over the prediction. If the "
+                       "image still does not change the way you want, the limit is semantic, "
+                       "not mechanical: a negated value vector is not read as a negative prompt")
+        logging.info(
+            "[Krea2 NegPiP] MEASURED effect on the model output: relative L2 %.4f%% "
+            "(peak abs delta %.4g) - %s.",
+            rel * 100.0, peak, verdict,
+        )
+    except Exception as exc:          # never let a diagnostic break sampling
+        logging.warning("[Krea2 NegPiP] could not measure the flip effect: %r", exc)
+
+    return with_flip
+
+
+_DEBUG_CALLS = 0
+
+
+def _debug_mode(value: Any) -> str:
+    """One widget, three states. Booleans from workflows saved before this was a combo still
+    load: True becomes "log"."""
+    if value is None:
+        return DEBUG_OFF
+    if isinstance(value, (bool, int, float)):
+        return DEBUG_LOG if value else DEBUG_OFF
+    text = str(value).strip().lower()
+    return text if text in DEBUG_MODES else DEBUG_OFF
+
+
+def _bump_debug_call_counter(cfg: dict[str, Any]) -> int:
+    """Module level on purpose: transformer_options (and the cfg inside it) is rebuilt for
+    every model call, so a counter stored there is always 1."""
+    global _DEBUG_CALLS
+    _DEBUG_CALLS += 1
+    return _DEBUG_CALLS
 
 
 class ApplyKrea2NegPiP:
@@ -1253,6 +1579,7 @@ class ApplyKrea2NegPiP:
                 "clip": ("CLIP",),
                 "value_strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 8.0, "step": 0.05}),
                 "patch_txtfusion_refiners": ("BOOLEAN", {"default": False}),
+                "debug": (DEBUG_MODES, {"default": DEBUG_OFF}),
             },
             "optional": {
                 "block_start": ("INT", {"default": 0, "min": 0, "max": 999, "step": 1}),
@@ -1267,7 +1594,7 @@ class ApplyKrea2NegPiP:
     CATEGORY = "loaders"
 
     def apply(self, model, clip, value_strength=1.0, patch_txtfusion_refiners=False,
-              block_start=0, block_end=27, block_stride=1):
+              debug=DEBUG_OFF, block_start=0, block_end=27, block_stride=1):
         new_clip = _patch_clip_for_krea2_negpip(clip)
         patched = model.clone()
 
@@ -1283,6 +1610,7 @@ class ApplyKrea2NegPiP:
             "enabled": True,
             "value_strength": value_strength,
             "patch_txtfusion_refiners": bool(patch_txtfusion_refiners),
+            "debug": _debug_mode(debug),
             "block_start": block_start,
             "block_end": block_end,
             "block_stride": block_stride,
